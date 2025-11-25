@@ -2,73 +2,106 @@
 #include "DisplayManager.h"
 #include <math.h>
 
+extern SensorData g_sensorData;
+
 DisplayManager g_display;
 
 void DisplayManager::begin() {
-  display.setBrightness(0x0f);
+  display.setBrightness(0x0f, true); // максимум яркости, включён
   display.clear();
-}
-
-void DisplayManager::showValue(char prefix, int value) {
-  // Формат: [префикс][десятки][единицы][пусто]
-  uint8_t segs[4] = {0,0,0,0};
-
-  // Буква
-  switch (prefix) {
-    case 'T': segs[0] = display.encodeDigit(0); segs[0] = 0b01111000; break; // T
-    case 'H': segs[0] = 0b01110110; break; // H
-    case 'S': segs[0] = 0b01101101; break; // S
-    case 't': segs[0] = 0b01111000; break; // t
-    default:  segs[0] = display.encodeDigit(0); break;
-  }
-
-  if (value < -9) value = -9;
-  if (value > 99) value = 99;
-
-  int absVal = abs(value);
-  int tens   = absVal / 10;
-  int ones   = absVal % 10;
-
-  segs[1] = display.encodeDigit(tens);
-  segs[2] = display.encodeDigit(ones);
-
-  display.setSegments(segs);
 }
 
 void DisplayManager::update() {
   unsigned long now = millis();
-  if (now - lastUpdate < 2000) return;
+  if (now - lastUpdate < Constants::DISPLAY_UPDATE_MS) return;
   lastUpdate = now;
 
   mode = (mode + 1) % 4;
 
-  float val = NAN;
-  char prefix = 'T';
-
   switch (mode) {
-    case 0: // T воздух
-      val = g_sensorData.airTemperature;
-      prefix = 'T';
-      break;
-    case 1: // H воздух
-      val = g_sensorData.airHumidity;
-      prefix = 'H';
-      break;
-    case 2: // Soil moisture
-      val = g_sensorData.soilMoisture;
-      prefix = 'S';
-      break;
-    case 3: // T почва
-      val = g_sensorData.soilTemperature;
-      prefix = 't';
-      break;
+    case 0: showAirTemp();     break;
+    case 1: showAirHumidity(); break;
+    case 2: showSoilMoisture();break;
+    case 3: showLux();         break;
   }
+}
 
-  if (isnan(val)) {
-    display.showNumberDec(0, true);
+// Формат: t XX   (t и XX)
+// Мы используем кастомные сегменты для буквы 't' и пробел
+static const uint8_t SEG_T = SEG_A | SEG_F | SEG_E | SEG_D; // что-то похожее на 't'
+
+void DisplayManager::showAirTemp() {
+  if (isnan(g_sensorData.airTemperature)) {
+    display.clear();
     return;
   }
+  int temp = (int)round(g_sensorData.airTemperature);
+  temp = constrain(temp, -99, 99);
 
-  int n = (int)round(val);
-  showValue(prefix, n);
+  uint8_t data[4];
+  data[0] = SEG_T;
+  if (temp < 0) {
+    data[1] = SEG_G; // минус (по сути только горизонтальная палка) — можно заменить
+    temp = -temp;
+  } else {
+    data[1] = 0;
+  }
+  int tens = temp / 10;
+  int ones = temp % 10;
+  data[2] = display.encodeDigit(tens);
+  data[3] = display.encodeDigit(ones);
+
+  display.setSegments(data);
+}
+
+void DisplayManager::showAirHumidity() {
+  if (isnan(g_sensorData.airHumidity)) {
+    display.clear();
+    return;
+  }
+  int hum = (int)round(g_sensorData.airHumidity);
+  hum = constrain(hum, 0, 99);
+  // Формат: H XX
+  uint8_t data[4];
+  // H — как A + F + E + B + C + G
+  uint8_t SEG_H = SEG_F | SEG_E | SEG_B | SEG_C | SEG_G;
+  data[0] = SEG_H;
+  data[1] = 0;
+  int tens = hum / 10;
+  int ones = hum % 10;
+  data[2] = display.encodeDigit(tens);
+  data[3] = display.encodeDigit(ones);
+  display.setSegments(data);
+}
+
+void DisplayManager::showSoilMoisture() {
+  if (isnan(g_sensorData.soilMoisture)) {
+    display.clear();
+    return;
+  }
+  int mos = (int)round(g_sensorData.soilMoisture);
+  mos = constrain(mos, 0, 99);
+  // Формат: S XX
+  uint8_t data[4];
+  // S — примерно как 5
+  uint8_t SEG_S = SEG_A | SEG_F | SEG_G | SEG_C | SEG_D;
+  data[0] = SEG_S;
+  data[1] = 0;
+  int tens = mos / 10;
+  int ones = mos % 10;
+  data[2] = display.encodeDigit(tens);
+  data[3] = display.encodeDigit(ones);
+  display.setSegments(data);
+}
+
+void DisplayManager::showLux() {
+  if (isnan(g_sensorData.lightLevelLux)) {
+    display.clear();
+    return;
+  }
+  int l = (int)round(g_sensorData.lightLevelLux);
+  if (l > 9999) l = 9999;
+  if (l < 0) l = 0;
+  // Формат: просто число (lux)
+  display.showNumberDec(l, true);
 }

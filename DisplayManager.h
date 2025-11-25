@@ -15,7 +15,10 @@ private:
   unsigned long lastUpdate = 0;
   uint8_t       mode       = 0;
 
-  void showValue(char prefix, int value);
+  void showAirTemp();
+  void showAirHumidity();
+  void showSoilMoisture();
+  void showLux();
 };
 
 extern DisplayManager g_display;

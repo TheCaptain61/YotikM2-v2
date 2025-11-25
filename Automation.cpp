@@ -8,7 +8,6 @@ void Automation::begin() {
   soilHistoryCount  = 0;
   soilHistoryIndex  = 0;
   lastSoilSampleMs  = millis();
-  lastPumpStartMs   = 0;
 
   doorCurrentlyOpen = false;
   fanCurrentlyOn    = false;
@@ -20,61 +19,90 @@ void Automation::loop() {
   if (!g_settings.automationEnabled) return;
 
   unsigned long now = millis();
-  if ((long)(now - lastAutomationRun) < (long)Constants::AUTOMATION_INTERVAL_MS) return;
+  if ((long)(now - lastAutomationRun) < (long)Constants::AUTOMATION_INTERVAL_MS) {
+    return;
+  }
   lastAutomationRun = now;
+
+  if ((long)(now - lastSoilSampleMs) >= (long)SOIL_SAMPLE_INTERVAL_MS &&
+      !isnan(g_sensorData.soilMoisture)) {
+    recordSoilHistory(g_sensorData.soilMoisture, now);
+    lastSoilSampleMs = now;
+  }
 
   handleClimate();
   handleLighting();
   handleWatering();
 }
 
-// ================== К Л И М А Т ==================
-
+// ===== Климат =====
 void Automation::handleClimate() {
   float t = g_sensorData.airTemperature;
   float h = g_sensorData.airHumidity;
 
-  if (isnan(t) || isnan(h)) return; // нечего регулировать
+  if (isnan(t) || isnan(h)) return;
 
   unsigned long now = millis();
 
-  // Пороги на основе комфортных значений из настроек
-  float hotThreshold      = g_settings.comfortTempMax + 1.0f; // чуть выше комфортной
-  float veryHotThreshold  = g_settings.comfortTempMax + 4.0f; // сильно жарко
-  float humidThreshold    = g_settings.comfortHumMax  + 3.0f; // повышенная влажность
-  float backTempThreshold = g_settings.comfortTempMax - 1.0f; // чтобы была гистерезис
-  float backHumThreshold  = g_settings.comfortHumMax  - 5.0f;
+  // Аварийные пороги
+  if (!isnan(g_settings.safetyTempMin) && t < g_settings.safetyTempMin) {
+    g_devices.setFan(false);
+    g_devices.setDoorAngle(Constants::SERVO_CLOSED_ANGLE);
+    doorCurrentlyOpen = false;
+    fanCurrentlyOn    = false;
+    Serial.println(F("⚠️ Холоднее safetyTempMin — закрываемся"));
+    return;
+  }
+
+  if (!isnan(g_settings.safetyTempMax) && t > g_settings.safetyTempMax) {
+    g_devices.setFan(true);
+    g_devices.setDoorAngle(Constants::SERVO_OPEN_ANGLE);
+    doorCurrentlyOpen = true;
+    fanCurrentlyOn    = true;
+    Serial.println(F("⚠️ Жарче safetyTempMax — максимум проветривания"));
+    return;
+  }
+
+  float baseMax = g_settings.comfortTempMax;
+  float baseHum = g_settings.comfortHumMax;
+
+  float hotDelta, veryHotDelta, backDelta;
+  switch (g_settings.climateMode) {
+    case 0: // Eco
+      hotDelta     = 2.0f;
+      veryHotDelta = 6.0f;
+      backDelta    = 1.5f;
+      break;
+    case 2: // Aggressive
+      hotDelta     = 0.5f;
+      veryHotDelta = 2.0f;
+      backDelta    = 0.5f;
+      break;
+    case 1:
+    default:
+      hotDelta     = 1.0f;
+      veryHotDelta = 4.0f;
+      backDelta    = 1.0f;
+      break;
+  }
+
+  float hotThreshold      = baseMax + hotDelta;
+  float veryHotThreshold  = baseMax + veryHotDelta;
+  float backTempThreshold = baseMax - backDelta;
+  float humidThreshold    = baseHum + 5.0f;
+  float backHumThreshold  = baseHum - 5.0f;
 
   bool wantStrongVent = (t > veryHotThreshold && h > humidThreshold);
-  bool wantMildVent   = (!wantStrongVent) && (t > hotThreshold || (t > g_settings.comfortTempMax && h > g_settings.comfortHumMax));
+  bool wantMildVent   = (!wantStrongVent) &&
+                        ((t > hotThreshold) || (h > baseHum));
   bool wantNoVent     = (t < backTempThreshold && h < backHumThreshold);
 
-  // ---- Сильное проветривание: дверь ОТКРЫТА + вентилятор ВКЛ ----
   if (wantStrongVent) {
-    // Дверь открыть (если ещё не открыта и выдержали минимум)
     if (!doorCurrentlyOpen && (now - lastDoorChangeMs) > DOOR_MIN_CLOSED_MS) {
       g_devices.setDoorAngle(Constants::SERVO_OPEN_ANGLE);
       doorCurrentlyOpen = true;
       lastDoorChangeMs  = now;
     }
-    // Вентилятор включить (если ещё не включен и выдержали минимум простоя)
-    if (!fanCurrentlyOn && (now - lastFanChangeMs) > FAN_MIN_OFF_MS) {
-      g_devices.setFan(true);
-      fanCurrentlyOn   = true;
-      lastFanChangeMs  = now;
-    }
-    return; // сильный режим приоритетный
-  }
-
-  // ---- Умеренное проветривание: дверь ЗАКРЫТА, вентилятор ВКЛ ----
-  if (wantMildVent) {
-    // Дверь закрыть (если открыта и минимум открытого времени прошёл)
-    if (doorCurrentlyOpen && (now - lastDoorChangeMs) > DOOR_MIN_OPEN_MS) {
-      g_devices.setDoorAngle(Constants::SERVO_CLOSED_ANGLE);
-      doorCurrentlyOpen = false;
-      lastDoorChangeMs  = now;
-    }
-    // Вентилятор включить
     if (!fanCurrentlyOn && (now - lastFanChangeMs) > FAN_MIN_OFF_MS) {
       g_devices.setFan(true);
       fanCurrentlyOn   = true;
@@ -83,209 +111,203 @@ void Automation::handleClimate() {
     return;
   }
 
-  // ---- Климат близок к норме: можно всё выключать, но не сразу ----
+  if (wantMildVent) {
+    if (!doorCurrentlyOpen && (now - lastDoorChangeMs) > DOOR_MIN_CLOSED_MS) {
+      g_devices.setDoorAngle(Constants::SERVO_HALF_ANGLE);
+      doorCurrentlyOpen = true;
+      lastDoorChangeMs  = now;
+    }
+    if (!fanCurrentlyOn && (now - lastFanChangeMs) > FAN_MIN_OFF_MS) {
+      g_devices.setFan(true);
+      fanCurrentlyOn   = true;
+      lastFanChangeMs  = now;
+    }
+    return;
+  }
+
   if (wantNoVent) {
-    // Вентилятор выключаем только если отработал минимум
+    if (doorCurrentlyOpen && (now - lastDoorChangeMs) > DOOR_MIN_OPEN_MS) {
+      g_devices.setDoorAngle(Constants::SERVO_CLOSED_ANGLE);
+      doorCurrentlyOpen = false;
+      lastDoorChangeMs  = now;
+    }
     if (fanCurrentlyOn && (now - lastFanChangeMs) > FAN_MIN_ON_MS) {
       g_devices.setFan(false);
       fanCurrentlyOn   = false;
       lastFanChangeMs  = now;
     }
-    // Дверь закрываем, если была открыта достаточно долго
-    if (doorCurrentlyOpen && (now - lastDoorChangeMs) > DOOR_MIN_OPEN_MS) {
-      g_devices.setDoorAngle(Constants::SERVO_CLOSED_ANGLE);
-      doorCurrentlyOpen = false;
-      lastDoorChangeMs  = now;
-    }
   }
 }
 
-// ================== С В Е Т ==================
-// Проверка, запрещено ли включение света по времени
-// Возвращает true если сейчас 20:00–06:00
-bool isNightTime() {
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-        // Если время не получено – ведём себя безопасно: считаем что свет ВКЛ можно
-        return false;
-    }
-
-    int hour = timeinfo.tm_hour;
-
-    // Запрещённый период: 20:00 – 06:00
-    return (hour >= 20 || hour < 6);
+// ===== Время =====
+bool Automation::getLocalHour(uint8_t &hourOut) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return false;
+  }
+  hourOut = timeinfo.tm_hour;
+  return true;
 }
 
+bool Automation::isNightTime() {
+  uint8_t h;
+  if (!getLocalHour(h)) {
+    Serial.println(F("[TIME] Нет времени, считаем что ночь (блок подсветки)"));
+    return true;
+  }
+
+  uint8_t cutoff = g_settings.lightCutoffHour;
+  if (h >= cutoff || h < 6) return true;
+  return false;
+}
+
+// ===== Свет =====
 void Automation::handleLighting() {
-    static float ambientLux = NAN;     // Окружающий свет без лампы
-    float lux = g_sensorData.lightLevelLux;
+  float lux = g_sensorData.lightLevelLux;
+  bool haveLux = !isnan(lux);
 
-    if (isnan(lux)) return;
+  bool night = isNightTime();
 
-    // Шаг 1 — если лампа выключена, обновляем окружающий свет
-    if (!g_sensorData.lightOn) {
-        ambientLux = lux;
+  // Ночь → свет всегда выключен
+  if (night) {
+    if (g_sensorData.lightOn) {
+      Serial.printf("[LIGHT] Ночь (cutoff %u), выключаем свет\n",
+                    g_settings.lightCutoffHour);
+      g_devices.setLight(false);
     }
-
-    // Шаг 2 — вычисляем освещённость для решения
-    float decisionLux;
-    if (!isnan(ambientLux) && g_sensorData.lightOn) {
-        decisionLux = ambientLux;          // пока лампа горит — используем ambientLux
-    } else {
-        decisionLux = lux;
-    }
-
-    // Шаг 3 — критерий темноты (решение по внешнему свету)
-    bool dark = decisionLux < g_settings.lightLuxMin;
-
-    // Шаг 4 — день или ночь по lux (60+
-    bool isDayLux = decisionLux > 60.0f;
-
-    // Шаг 5 — пользователь разрешил свет ночью или нет
-    bool allowNight = g_settings.allowNightLight;
-
-    // Шаг 6 — запрет включать свет после 20:00
-    bool nightTimeBlocked = isNightTime();   // true с 20:00 до 06:00
-
-    // Логика: Включаем свет только если
-    // - темно
-    // - и (день по lux или разрешено ночью)
-    // - и НЕ запрещено временем
-    bool shouldLight = false;
-
-    if (dark) {
-        if ( (isDayLux || allowNight) && !nightTimeBlocked ) {
-            shouldLight = true;
-        }
-    }
-
-    g_devices.setLight(shouldLight);
-}
-// ================== П О Л И В (умный) ==================
-
-void Automation::recordSoilHistory(float moisture, unsigned long nowMs) {
-  // пишем точку истории раз в SOIL_SAMPLE_INTERVAL_MS
-  if ((nowMs - lastSoilSampleMs) < SOIL_SAMPLE_INTERVAL_MS) return;
-  lastSoilSampleMs = nowMs;
-
-  soilMoistureHistory[soilHistoryIndex] = moisture;
-  soilTimeHistory[soilHistoryIndex]     = nowMs;
-
-  if (soilHistoryCount < SOIL_HISTORY_SIZE) {
-    soilHistoryCount++;
-  }
-  soilHistoryIndex = (soilHistoryIndex + 1) % SOIL_HISTORY_SIZE;
-}
-
-// Возвращает наклон (%/час) по истории, <0 = сохнет, >0 = влажнеет
-float Automation::computeSoilDryingSlope(float &hoursSpan) {
-  hoursSpan = 0.0f;
-  if (soilHistoryCount < 2) return 0.0f;
-
-  uint8_t newestIdx = (soilHistoryIndex + SOIL_HISTORY_SIZE - 1) % SOIL_HISTORY_SIZE;
-  uint8_t oldestIdx = (soilHistoryIndex + SOIL_HISTORY_SIZE - soilHistoryCount) % SOIL_HISTORY_SIZE;
-
-  float     moistOld = soilMoistureHistory[oldestIdx];
-  float     moistNew = soilMoistureHistory[newestIdx];
-  unsigned long tOld = soilTimeHistory[oldestIdx];
-  unsigned long tNew = soilTimeHistory[newestIdx];
-
-  unsigned long dMs = tNew - tOld;
-  if (dMs < 10000UL) { // меньше 10 секунд — нет смысла
-    return 0.0f;
+    return;
   }
 
-  hoursSpan = dMs / (1000.0f * 3600.0f); // в часах
-  if (hoursSpan <= 0.0f) return 0.0f;
+  // День, но нет показаний lux — оставляем как есть
+  if (!haveLux) {
+    Serial.println("[LIGHT] Нет данных lux, состояние света не трогаем");
+    return;
+  }
 
-  float dM = moistNew - moistOld; // % влажности
-  float slope = dM / hoursSpan;   // % в час
-  return slope;
+  const float LUX_ON_THRESHOLD = 60.0f;
+
+  // Если свет уже горит — держим его до наступления ночи, lux игнорируем
+  if (g_sensorData.lightOn) {
+    Serial.printf("[LIGHT] День, свет уже включен (lux=%.1f) — оставляем включенным\n", lux);
+    return;
+  }
+
+  // Свет выключен → решаем, включать ли
+  if (lux < LUX_ON_THRESHOLD) {
+    Serial.printf("[LIGHT] lux=%.1f < %.1f — включаем свет\n",
+                  lux, LUX_ON_THRESHOLD);
+    g_devices.setLight(true);
+  } else {
+    Serial.printf("[LIGHT] lux=%.1f >= %.1f — свет выключен, не включаем\n",
+                  lux, LUX_ON_THRESHOLD);
+  }
 }
 
+
+// ===== Окно полива =====
+bool Automation::isWithinWateringWindow() {
+  uint8_t h;
+  if (!getLocalHour(h)) {
+    return false;
+  }
+
+  uint8_t startH = g_settings.wateringStartHour;
+  uint8_t endH   = g_settings.wateringEndHour;
+
+  if (startH == endH) return true;
+  if (startH < endH) {
+    return (h >= startH && h < endH);
+  } else {
+    return (h >= startH || h < endH);
+  }
+}
+
+// ===== Полив =====
 void Automation::handleWatering() {
   float moist = g_sensorData.soilMoisture;
   if (isnan(moist)) return;
 
-  unsigned long now = millis();
-
-  // Записать точку в историю (используется для тренда)
-  recordSoilHistory(moist, now);
-
-  float setpoint   = g_settings.soilMoistureSetpoint;
-  float hysteresis = g_settings.soilMoistureHysteresis;
-
-  if (setpoint < 0)   setpoint = 0;
-  if (setpoint > 100) setpoint = 100;
-  if (hysteresis < 1) hysteresis = 1;
-
-  float dryThreshold = setpoint - hysteresis;
-  if (dryThreshold < 0) dryThreshold = 0;
-
-  // Ограничения по насосу
-  bool cooldownOk =
-    (now - lastPumpStartMs) > Constants::PUMP_COOLDOWN_MS;
-
-  bool dailyBudgetOk =
-    (g_devices.getTotalPumpMsToday() + Constants::PUMP_PULSE_MS) <= Constants::PUMP_DAILY_LIMIT_MS;
-
-  float soilT = g_sensorData.soilTemperature;
-  bool soilTooCold = (!isnan(soilT) && soilT < 5.0f); // очень холодная почва — не льём
-
-  // Если базовые ограничения не соблюдены — даже не думаем о поливе
-  if (!cooldownOk || !dailyBudgetOk || soilTooCold) {
+  if (!isWithinWateringWindow()) {
     return;
   }
 
-  // Анализ тренда высыхания
-  float hoursSpan = 0.0f;
-  float slope = computeSoilDryingSlope(hoursSpan); // %/час
+  float setpoint = g_settings.soilMoistureSetpoint;
+  float hyst     = g_settings.soilMoistureHysteresis;
+  float lowTh    = setpoint - hyst;
+  float highTh   = setpoint + hyst;
 
-  bool haveTrend = (hoursSpan > 0.15f); // хотя бы ~9 минут истории
-  bool isDry     = (moist <= dryThreshold);
+  float slope = computeSoilDryingSlope(); // %/час
 
-  bool approachingDry = false;
-  unsigned long predictedToDryMs = 0;
+  bool veryDryNow  = moist < (lowTh - 5.0f);
+  bool dryNow      = moist < lowTh;
+  bool wetEnough   = moist > highTh;
 
-  if (haveTrend && slope < -0.5f && moist > dryThreshold) {
-    // Считаем, через сколько часов упадём до dryThreshold
-    // slope < 0, moist > dryThreshold
-    float dM = dryThreshold - moist; // отрицательное значение
-    float hoursToThresh = dM / slope; // получится >0 если всё ок
-    if (hoursToThresh > 0.0f && hoursToThresh < 6.0f) { // в течение 6 часов
-      approachingDry    = true;
-      predictedToDryMs  = (unsigned long)(hoursToThresh * 3600.0f * 1000.0f);
-    }
+  if (veryDryNow) {
+    Serial.printf("💧 Сильно сухо (%.1f%%), поливаем\n", moist);
+    g_devices.setPump(true, 1400);
+    return;
   }
 
-  // Если тренд положительный (увлажняется) и причём сильно — вероятно, недавно поливали или датчик под водой
-  bool moistureRisingFast = (haveTrend && slope > 3.0f); // +3%/час и больше
-
-  bool shouldWater = false;
-
-  if (isDry) {
-    // Сухо здесь и сейчас, но не поливаем, если влажность уже активно растёт
-    if (!moistureRisingFast) {
-      shouldWater = true;
-      Serial.println(F("💧 Полив: почва уже сухая по порогу"));
+  if (dryNow) {
+    if (slope >= 0.1f) {
+      Serial.printf("💧 Сухо (%.1f%%), тренд %.2f%%/ч — поливаем\n", moist, slope);
+      g_devices.setPump(true, 1200);
+    } else {
+      Serial.printf("💧 Сухо (%.1f%%), тренд медленный — краткий полив\n", moist);
+      g_devices.setPump(true, 800);
     }
-  } else if (approachingDry) {
-    // Ещё не сухо, но высохнет в ближайшие часы — можем полить заранее
-    if (!moistureRisingFast) {
-      shouldWater = true;
-      Serial.printf("💧 Полив: предиктивно, через ~%lu мин станет сухо\n", predictedToDryMs / 60000UL);
-    }
+    return;
   }
 
-  if (!shouldWater) return;
+  if (wetEnough && g_sensorData.pumpOn) {
+    Serial.printf("💧 Влаги достаточно (%.1f%%), выключаем насос\n", moist);
+    g_devices.setPump(false);
+  }
+}
 
-  // Уточнение по ночи: если очень темно и не хотим поливать ночью, можно добавить условие здесь.
-  // Сейчас — поливаем в любое время суток.
+// ===== История влажности =====
+void Automation::recordSoilHistory(float moisture, unsigned long nowMs) {
+  if (soilHistoryCount < SOIL_HISTORY_MAX) {
+    soilHistoryCount++;
+  }
 
-  // Запускаем насос на импульс
-  g_devices.setPump(true, Constants::PUMP_PULSE_MS);
-  lastPumpStartMs = now;
+  soilMoistureHistory[soilHistoryIndex] = moisture;
+  soilTimeHistory[soilHistoryIndex]     = nowMs;
+  soilHistoryIndex = (soilHistoryIndex + 1) % SOIL_HISTORY_MAX;
+}
 
-  Serial.printf("💧 Импульс полива: влажность=%.1f%%, цель=%.1f%% (сухой порог=%.1f%%), тренд=%.2f %%/ч\n",
-                moist, setpoint, dryThreshold, slope);
+float Automation::computeSoilDryingSlope() {
+  if (soilHistoryCount < 4) return 0.0f;
+
+  float n = (float)soilHistoryCount;
+
+  double sumT = 0.0;
+  double sumM = 0.0;
+  double sumTT = 0.0;
+  double sumTM = 0.0;
+
+  uint8_t firstIdx = (soilHistoryIndex + SOIL_HISTORY_MAX - soilHistoryCount) %
+                     SOIL_HISTORY_MAX;
+  unsigned long t0 = soilTimeHistory[firstIdx];
+
+  for (uint8_t i = 0; i < soilHistoryCount; ++i) {
+    uint8_t idx = (firstIdx + i) % SOIL_HISTORY_MAX;
+    unsigned long dtMs = soilTimeHistory[idx] - t0;
+    double tHours = (double)dtMs / 3600000.0;
+    double m      = soilMoistureHistory[idx];
+
+    sumT  += tHours;
+    sumM  += m;
+    sumTT += tHours * tHours;
+    sumTM += tHours * m;
+  }
+
+  double denom = (n * sumTT - sumT * sumT);
+  if (fabs(denom) < 1e-6) return 0.0f;
+
+  double a = (n * sumTM - sumT * sumM) / denom; // slope %/час
+
+  if (a < -20.0 || a > 0.0) return 0.0f;
+
+  return (float)(-a);
 }

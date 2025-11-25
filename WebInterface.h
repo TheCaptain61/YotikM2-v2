@@ -7,6 +7,7 @@
 #include "Automation.h"
 #include "EEPROMManager.h"
 #include "Profiles.h"
+
 #include <WiFi.h>
 #include <WebServer.h>
 
@@ -20,24 +21,29 @@ private:
 
   void setupWiFi();
 
-  // Страницы
+  // страницы
   void handleRoot();
-  void handleDiagnosticsPage();
-  void handleWifiPage();
+  void handleNotFound();
 
   // API
   void handleSensors();
   void handleSettingsGet();
   void handleSettingsPost();
   void handleControl();
-  void handleCalibrate();
   void handleDiagnosticsApi();
   void handleWifiScan();
   void handleWifiSet();
 
+  // JSON
   String buildSensorsJson();
   String buildSettingsJson();
   String buildDiagnosticsJson();
+
+  // простая BASIC-авторизация
+  bool ensureAuth();
+
+  static constexpr const char* WEB_USER = "admin";
+  static constexpr const char* WEB_PASS = "greenhouse";
 };
 
 extern WebInterface g_web;

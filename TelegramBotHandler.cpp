@@ -13,54 +13,54 @@ void TelegramBotHandler::begin() {
     return;
   }
 
-  client.setInsecure();
+  client.setInsecure(); // если хочешь жёсткий TLS — можно настроить fingerprint
   bot = new UniversalTelegramBot(TelegramConfig::BOT_TOKEN, client);
 
-  unsigned long now = millis();
-  lastPollMs        = now;
-  lastAlertCheckMs  = now;
-  lastDryAlertMs    = 0;
-  lastHotAlertMs    = 0;
-  lastColdAlertMs   = 0;
-  lastSensorAlertMs = 0;
-
-  // Если CHAT_ID задан в Config.h — используем его как основной
   if (strlen(TelegramConfig::CHAT_ID) > 0) {
     primaryChatId = TelegramConfig::CHAT_ID;
   }
 
-  Serial.println(F("🤖 Telegram-бот инициализирован"));
+  Serial.println(F("🤖 Telegram бот инициализирован"));
+}
+
+String TelegramBotHandler::mainKeyboardJson() {
+  // reply-клавиатура:
+  //  [ "📊 Статус", "💧 Полив" ]
+  //  [ "⚙ Авто ВКЛ", "⏸ Авто ВЫКЛ" ]
+  //  [ "🌡 Профили", "🔔 Увед. ВКЛ/ВЫКЛ" ]
+  String k = "["
+             "[\"📊 Статус\",\"💧 Полив\"],"
+             "[\"⚙ Авто ВКЛ\",\"⏸ Авто ВЫКЛ\"],"
+             "[\"🌡 Профили\",\"🔔 Увед. ВКЛ/ВЫКЛ\"]"
+             "]";
+  return k;
 }
 
 void TelegramBotHandler::loop() {
   if (!bot) return;
-  if (WiFi.status() != WL_CONNECTED) return;
 
   unsigned long now = millis();
 
-  // Опрос входящих сообщений
   if (now - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = now;
     int n = bot->getUpdates(bot->last_message_received + 1);
-    if (n) {
+    if (n > 0) {
       handleNewMessages(n);
     }
   }
 
-  // Проверка тревог / уведомлений
-  if (now - lastAlertCheckMs >= ALERT_CHECK_MS) {
-    lastAlertCheckMs = now;
+  if (notificationsEnabled && now - lastSensorAlertMs >= ALERT_CHECK_MS) {
     checkAndSendAlerts();
   }
 }
 
 void TelegramBotHandler::handleNewMessages(int n) {
-  for (int i = 0; i < n; i++) {
-    String chat_id = bot->messages[i].chat_id;
-    String text    = bot->messages[i].text;
+  for (int i = 0; i < n; ++i) {
+    const telegramMessage &msg = bot->messages[i];
+    String chat_id = msg.chat_id;
+    String text    = msg.text;
 
-    // Сохраняем чат для уведомлений
-    if (chat_id.length() > 0) {
+    if (primaryChatId.length() == 0) {
       primaryChatId = chat_id;
     }
 
@@ -68,325 +68,272 @@ void TelegramBotHandler::handleNewMessages(int n) {
   }
 }
 
-void TelegramBotHandler::sendMainMenu(const String &chat_id) {
-  // Reply-клавиатура: строки с командами
-  // Каждая строка — массив текстов кнопок; текст = команда, которая отправится
-  String keyboard =
-    "["
-      "[\"/status\",\"/water_now\"],"
-      "[\"/auto_on\",\"/auto_off\"],"
-      "[\"/notify_on\",\"/notify_off\"],"
-      "[\"/profile_tomatoes\",\"/profile_cucumbers\",\"/profile_greens\"]"
-    "]";
+void TelegramBotHandler::handleCommand(const String &chat_id, const String &text) {
+  String t = text;
+  t.trim();
 
-  // true в конце — сделать клавиатуру "одноразовой" (можно убрать, если хочешь постоянную)
-  bot->sendMessageWithReplyKeyboard(
-    chat_id,
-    "🌱 <b>Умная теплица ЙоТик М2</b>\nКнопки ниже отправляют команды.",
-    "HTML",
-    keyboard,
-    true
-  );
-}
-
-void TelegramBotHandler::sendHelp(const String &chat_id) {
-  String msg;
-  msg  = "🌱 <b>Умная теплица ЙоТик М2</b>\n\n";
-  msg += "<b>Основные команды:</b>\n";
-  msg += "<code>/status</code> - статус теплицы\n";
-  msg += "<code>/auto_on</code>, <code>/auto_off</code> - включить/выключить автоматику\n";
-  msg += "<code>/notify_on</code>, <code>/notify_off</code> - уведомления\n";
-  msg += "<code>/water_now</code> - немедленный импульсный полив\n";
-  msg += "<code>/set_soil_target 60</code> - целевая влажность почвы\n";
-  msg += "<code>/set_profile tomatoes|cucumbers|greens|custom</code> - профиль культуры\n\n";
-  msg += "<b>Ручное управление:</b>\n";
-  msg += "<code>/pump_on</code> / <code>/pump_off</code>\n";
-  msg += "<code>/fan_on</code> / <code>/fan_off</code>\n";
-  msg += "<code>/light_on</code> / <code>/light_off</code>\n";
-  msg += "<code>/door_open</code> / <code>/door_close</code>\n";
-
-  bot->sendMessage(chat_id, msg, "HTML");
-}
-
-void TelegramBotHandler::handleCommand(const String &chat_id, const String &rawText) {
-  String cmd = rawText;
-  cmd.trim();
-
-  // Если без "/", подменим help/status
-  if (!cmd.startsWith("/")) {
-    if (cmd.equalsIgnoreCase("help"))   cmd = "/help";
-    if (cmd.equalsIgnoreCase("status")) cmd = "/status";
-  }
-
-  // === Меню / старт ===
-  if (cmd == "/start") {
+  if (t == "/start") {
     sendMainMenu(chat_id);
+    return;
+  }
+
+  if (t == "/help") {
     sendHelp(chat_id);
     return;
   }
 
-  if (cmd == "/help") {
-    sendHelp(chat_id);
-    return;
-  }
-
-  // === Статус ===
-  if (cmd == "/status") {
+  if (t == "/status" || t == "📊 Статус") {
     sendStatus(chat_id);
     return;
   }
 
-  // === Автоматизация ===
-  if (cmd == "/auto_on") {
+  if (t == "/auto_on" || t == "⚙ Авто ВКЛ") {
     g_settings.automationEnabled = true;
     g_eeprom.saveSettings(g_settings);
-    bot->sendMessage(chat_id, "🤖 Автоматизация: <b>ВКЛ</b>", "HTML");
+    bot->sendMessageWithReplyKeyboard(chat_id,
+                                      "✅ Автоматика включена",
+                                      "HTML",
+                                      mainKeyboardJson(),
+                                      true);
     return;
   }
 
-  if (cmd == "/auto_off") {
+  if (t == "/auto_off" || t == "⏸ Авто ВЫКЛ") {
     g_settings.automationEnabled = false;
     g_eeprom.saveSettings(g_settings);
-    bot->sendMessage(chat_id, "🤖 Автоматизация: <b>ВЫКЛ</b>", "HTML");
+    bot->sendMessageWithReplyKeyboard(chat_id,
+                                      "⏸ Автоматика выключена",
+                                      "HTML",
+                                      mainKeyboardJson(),
+                                      true);
     return;
   }
 
-  // === Уведомления ===
-  if (cmd == "/notify_on") {
+  if (t == "/water_now" || t == "💧 Полив") {
+    g_devices.setPump(true, 1200);
+    bot->sendMessageWithReplyKeyboard(chat_id,
+                                      "💧 Запущен импульсный полив",
+                                      "HTML",
+                                      mainKeyboardJson(),
+                                      true);
+    return;
+  }
+
+  if (t == "/notify_on") {
     notificationsEnabled = true;
-    bot->sendMessage(chat_id, "🔔 Уведомления: <b>ВКЛЮЧЕНЫ</b>", "HTML");
+    bot->sendMessageWithReplyKeyboard(chat_id,
+                                      "🔔 Уведомления включены",
+                                      "HTML",
+                                      mainKeyboardJson(),
+                                      true);
     return;
   }
 
-  if (cmd == "/notify_off") {
+  if (t == "/notify_off") {
     notificationsEnabled = false;
-    bot->sendMessage(chat_id, "🔕 Уведомления: <b>ВЫКЛЮЧЕНЫ</b>", "HTML");
+    bot->sendMessageWithReplyKeyboard(chat_id,
+                                      "🔕 Уведомления выключены",
+                                      "HTML",
+                                      mainKeyboardJson(),
+                                      true);
     return;
   }
 
-  // === Полив ===
-  if (cmd == "/water_now" || cmd == "/water") {
-    g_devices.setPump(true, Constants::PUMP_PULSE_MS);
-    bot->sendMessage(chat_id, "💧 Импульсный полив запущен", "HTML");
+  if (t == "🔔 Увед. ВКЛ/ВЫКЛ") {
+    notificationsEnabled = !notificationsEnabled;
+    bot->sendMessageWithReplyKeyboard(chat_id,
+                                      notificationsEnabled ? "🔔 Уведомления включены"
+                                                           : "🔕 Уведомления выключены",
+                                      "HTML",
+                                      mainKeyboardJson(),
+                                      true);
     return;
   }
 
-  if (cmd == "/pump_on") {
-    g_devices.setPump(true, Constants::PUMP_PULSE_MS);
-    bot->sendMessage(chat_id, "💧 Насос ВКЛ (импульс)", "HTML");
+  if (t == "🌡 Профили" || t == "/profiles") {
+    sendProfileMenu(chat_id);
     return;
   }
 
-  if (cmd == "/pump_off") {
-    g_devices.setPump(false, 0);
-    bot->sendMessage(chat_id, "💧 Насос ВЫКЛ", "HTML");
-    return;
-  }
-
-  // === Вентилятор / свет / дверь ===
-  if (cmd == "/fan_on") {
-    g_devices.setFan(true);
-    bot->sendMessage(chat_id, "🌬️ Вентилятор ВКЛ", "HTML");
-    return;
-  }
-  if (cmd == "/fan_off") {
-    g_devices.setFan(false);
-    bot->sendMessage(chat_id, "🌬️ Вентилятор ВЫКЛ", "HTML");
-    return;
-  }
-
-  if (cmd == "/light_on") {
-    g_devices.setLight(true);
-    bot->sendMessage(chat_id, "💡 Свет ВКЛ", "HTML");
-    return;
-  }
-  if (cmd == "/light_off") {
-    g_devices.setLight(false);
-    bot->sendMessage(chat_id, "💡 Свет ВЫКЛ", "HTML");
-    return;
-  }
-
-  if (cmd == "/door_open") {
-    g_devices.setDoorAngle(Constants::SERVO_OPEN_ANGLE);
-    bot->sendMessage(chat_id, "🚪 Дверь ОТКРЫТА", "HTML");
-    return;
-  }
-  if (cmd == "/door_close") {
-    g_devices.setDoorAngle(Constants::SERVO_CLOSED_ANGLE);
-    bot->sendMessage(chat_id, "🚪 Дверь ЗАКРЫТА", "HTML");
-    return;
-  }
-
-  // === Настройки: целевая влажность почвы ===
-  if (cmd.startsWith("/set_soil_target")) {
-    int spaceIdx = cmd.indexOf(' ');
-    if (spaceIdx > 0 && spaceIdx < (int)cmd.length()-1) {
-      String valStr = cmd.substring(spaceIdx+1);
-      float target = valStr.toFloat();
-      if (target > 0 && target < 100) {
-        g_settings.soilMoistureSetpoint = target;
-        g_eeprom.saveSettings(g_settings);
-        bot->sendMessage(chat_id, "🌱 Целевая влажность почвы: <b>" + String(target,1) + "%</b>", "HTML");
-      } else {
-        bot->sendMessage(chat_id, "❗ Укажи число от 1 до 99, например:\n<code>/set_soil_target 60</code>", "HTML");
-      }
-    } else {
-      bot->sendMessage(chat_id, "Использование:\n<code>/set_soil_target 60</code>", "HTML");
-    }
-    return;
-  }
-
-  // === Настройки: профиль культуры ===
-  if (cmd.startsWith("/set_profile") || cmd.startsWith("/profile_")) {
-    String name;
-    // кнопки вида /profile_tomatoes
-    if (cmd.startsWith("/profile_")) {
-      name = cmd.substring(String("/profile_").length());
-    } else {
-      int spaceIdx = cmd.indexOf(' ');
-      if (spaceIdx > 0 && spaceIdx < (int)cmd.length()-1) {
-        name = cmd.substring(spaceIdx+1);
-      }
-    }
-
-    name.toLowerCase();
-
-    uint8_t id = 0;
-    if (name == "tomatoes" || name == "tomato" || name == "tomat" || name == "помидоры") id = 1;
-    else if (name == "cucumbers" || name == "cucumber" || name == "огурцы") id = 2;
-    else if (name == "greens" || name == "зелень") id = 3;
-    else if (name == "custom" || name == "user") id = 0;
-
-    applyCropProfile(id, g_settings);
+  // Быстрая смена профиля кнопками
+  if (t == "🍅 Помидоры") {
+    applyCropProfile(1, g_settings);
     g_eeprom.saveSettings(g_settings);
-
-    String caption;
-    switch (id) {
-      case 1: caption = "🍅 Профиль: помидоры"; break;
-      case 2: caption = "🥒 Профиль: огурцы";   break;
-      case 3: caption = "🌿 Профиль: зелень";   break;
-      default: caption = "⚙️ Профиль: пользовательский"; break;
-    }
-
-    bot->sendMessage(chat_id, caption, "HTML");
+    bot->sendMessageWithReplyKeyboard(chat_id,
+        "✅ Профиль: помидоры", "HTML", mainKeyboardJson(), true);
+    return;
+  }
+  if (t == "🥒 Огурцы") {
+    applyCropProfile(2, g_settings);
+    g_eeprom.saveSettings(g_settings);
+    bot->sendMessageWithReplyKeyboard(chat_id,
+        "✅ Профиль: огурцы", "HTML", mainKeyboardJson(), true);
+    return;
+  }
+  if (t == "🌿 Зелень") {
+    applyCropProfile(3, g_settings);
+    g_eeprom.saveSettings(g_settings);
+    bot->sendMessageWithReplyKeyboard(chat_id,
+        "✅ Профиль: зелень", "HTML", mainKeyboardJson(), true);
+    return;
+  }
+  if (t == "🌺 Гибискус") {
+    applyCropProfile(4, g_settings);
+    g_eeprom.saveSettings(g_settings);
+    bot->sendMessageWithReplyKeyboard(chat_id,
+        "✅ Профиль: гибискус", "HTML", mainKeyboardJson(), true);
     return;
   }
 
-  // Если команда не распознана
-  bot->sendMessage(chat_id, "Неизвестная команда. Напиши <code>/help</code>", "HTML");
+  // Команды типа /set_soil_target 60
+  if (t.startsWith("/set_soil_target")) {
+    int val = t.substring(String("/set_soil_target").length()).toInt();
+    if (val >= 20 && val <= 90) {
+      g_settings.soilMoistureSetpoint = (float)val;
+      g_eeprom.saveSettings(g_settings);
+      bot->sendMessageWithReplyKeyboard(chat_id,
+        "✅ Целевая влажность почвы: " + String(val) + "%",
+        "HTML",
+        mainKeyboardJson(),
+        true);
+    } else {
+      bot->sendMessage(chat_id,
+        "⚠️ Значение должно быть от 20 до 90",
+        "HTML");
+    }
+    return;
+  }
+
+  // Если ничего не узнали
+  bot->sendMessageWithReplyKeyboard(chat_id,
+    "Неизвестная команда. Нажми кнопку или /help",
+    "HTML",
+    mainKeyboardJson(),
+    true);
 }
 
 void TelegramBotHandler::sendStatus(const String &chat_id) {
-  float Ta = g_sensorData.airTemperature;
-  float Ha = g_sensorData.airHumidity;
-  float Ts = g_sensorData.soilTemperature;
-  float Ms = g_sensorData.soilMoisture;
-  float Lx = g_sensorData.lightLevelLux;
+  String msg;
+  msg.reserve(512);
 
-  float hoursSpan = 0.0f;
-  float slope = g_automation.computeSoilDryingSlope(hoursSpan); // %/час
+  msg  = "🌱 <b>Состояние теплицы</b>\n\n";
+  msg += "🌡 Воздух: ";
+  msg += String(g_sensorData.airTemperature,1);
+  msg += "°C, ";
+  msg += String(g_sensorData.airHumidity,1);
+  msg += "%\n";
 
-  float setpoint = g_settings.soilMoistureSetpoint;
-  float hyster   = g_settings.soilMoistureHysteresis;
-  float dryPoint = setpoint - hyster;
+  msg += "🌱 Почва: ";
+  msg += String(g_sensorData.soilMoisture,1);
+  msg += "%\n";
 
-  String dryForecast = "—";
+  msg += "💡 Свет: ";
+  msg += String(g_sensorData.lightLevelLux,1);
+  msg += " lux\n\n";
 
-  if (!isnan(Ms) && slope < 0 && Ms > dryPoint) {
-    float dM = dryPoint - Ms;      // отрицательное
-    float hoursToDry = dM / slope; // slope < 0 → >0
-    if (hoursToDry > 0 && hoursToDry < 72) {
-      int h = int(hoursToDry);
-      int m = int((hoursToDry - h) * 60);
-      dryForecast = String(h) + " ч " + String(m) + " мин";
-    }
+  msg += "⚙️ Автоматика: ";
+  msg += (g_settings.automationEnabled ? "ВКЛ" : "ВЫКЛ");
+  msg += "\n";
+
+  msg += "🚿 Насос: ";
+  msg += (g_sensorData.pumpOn ? "ВКЛ" : "ВЫКЛ");
+  msg += "\n";
+
+  msg += "🌀 Вентиляция: ";
+  msg += (g_sensorData.fanOn ? "ВКЛ" : "ВЫКЛ");
+  msg += "\n";
+
+  msg += "🚪 Дверь: ";
+  msg += (g_sensorData.doorOpen ? "ОТКРЫТА" : "ЗАКРЫТА");
+  msg += "\n";
+
+  msg += "🥗 Профиль: ";
+  switch (g_settings.cropProfile) {
+    case 1: msg += "помидоры"; break;
+    case 2: msg += "огурцы";   break;
+    case 3: msg += "зелень";   break;
+    case 4: msg += "гибискус"; break;
+    default: msg += "custom";  break;
   }
 
-  String msg = "📊 <b>Статус теплицы</b>\n\n";
+  bot->sendMessageWithReplyKeyboard(chat_id,
+                                    msg,
+                                    "HTML",
+                                    mainKeyboardJson(),
+                                    true);
+}
 
-  msg += "🌡 <b>Воздух</b>: " + String(Ta,1) + "°C, " + String(Ha,1) + "%\n";
-  msg += "🌱 <b>Почва</b>:  " + String(Ts,1) + "°C, " + String(Ms,1) + "%\n";
-  msg += "💡 <b>Свет</b>:   " + String(Lx,1) + " lux\n\n";
+void TelegramBotHandler::sendMainMenu(const String &chat_id) {
+  String msg = "Привет! Это умная теплица ЙоТик M2.\n"
+               "Нажимай кнопки или введи /help для списка команд.";
+  bot->sendMessageWithReplyKeyboard(chat_id,
+                                    msg,
+                                    "HTML",
+                                    mainKeyboardJson(),
+                                    true);
+}
 
-  msg += "🚰 <b>Полив</b>\n";
-  msg += "  Цель: " + String(setpoint,1) + "%\n";
-  msg += "  Порог сухости: " + String(dryPoint,1) + "%\n";
-  msg += "  Тренд влажности: ";
-  if (hoursSpan < 0.15f) msg += "мало данных\n";
-  else msg += String(slope,2) + " %/ч\n";
-  msg += "  Прогноз до высыхания: " + dryForecast + "\n\n";
+void TelegramBotHandler::sendProfileMenu(const String &chat_id) {
+  // Отдельная клавиатура для выбора профиля
+  String k = "["
+             "[\"🍅 Помидоры\",\"🥒 Огурцы\"],"
+             "[\"🌿 Зелень\",\"🌺 Гибискус\"],"
+             "[\"⬅ Назад\"]"
+             "]";
+  String msg = "Выбери профиль культуры:";
+  bot->sendMessageWithReplyKeyboard(chat_id,
+                                    msg,
+                                    "HTML",
+                                    k,
+                                    true);
+}
 
-  msg += "🤖 <b>Режимы</b>\n";
-  msg += "  Автоматизация: " + String(g_settings.automationEnabled ? "ВКЛ" : "выкл") + "\n";
-  msg += "  Уведомления: "   + String(notificationsEnabled ? "ВКЛ" : "выкл") + "\n\n";
-
-  msg += "🔌 <b>Устройства</b>\n";
-  msg += "  Насос: "      + String(g_sensorData.pumpOn ? "ВКЛ" : "выкл") + "\n";
-  msg += "  Вентилятор: " + String(g_sensorData.fanOn  ? "ВКЛ" : "выкл") + "\n";
-  msg += "  Свет: "       + String(g_sensorData.lightOn ? "ВКЛ" : "выкл") + "\n";
-  msg += "  Дверь: "      + String(g_sensorData.doorOpen ? "открыта" : "закрыта") + "\n";
-
-  bot->sendMessage(chat_id, msg, "HTML");
+void TelegramBotHandler::sendHelp(const String &chat_id) {
+  String msg;
+  msg  = "🌱 <b>Умная теплица ЙоТик M2</b>\n\n";
+  msg += "<b>Основные команды:</b>\n";
+  msg += "📊 Статус — текущее состояние\n";
+  msg += "💧 Полив — импульсный полив\n";
+  msg += "⚙ Авто ВКЛ / ⏸ Авто ВЫКЛ — управление автоматикой\n";
+  msg += "🌡 Профили — быстрый выбор культуры\n";
+  msg += "🔔 Увед. ВКЛ/ВЫКЛ — уведомления\n\n";
+  msg += "<b>Текстовые команды:</b>\n";
+  msg += "<code>/status</code>, <code>/auto_on</code>, <code>/auto_off</code>\n";
+  msg += "<code>/notify_on</code>, <code>/notify_off</code>\n";
+  msg += "<code>/water_now</code>\n";
+  msg += "<code>/set_soil_target 60</code> — целевая влажность почвы\n";
+  msg += "<code>/profiles</code> — меню профилей\n";
+  bot->sendMessageWithReplyKeyboard(chat_id,
+                                    msg,
+                                    "HTML",
+                                    mainKeyboardJson(),
+                                    true);
 }
 
 void TelegramBotHandler::checkAndSendAlerts() {
-  if (!notificationsEnabled) return;
-  if (!bot) return;
-  if (primaryChatId.length() == 0) return;
-
   unsigned long now = millis();
 
-  float Ta = g_sensorData.airTemperature;
-  float Ms = g_sensorData.soilMoisture;
-
-  // 1) Слишком сухая почва
-  float setpoint = g_settings.soilMoistureSetpoint;
-  float hyster   = g_settings.soilMoistureHysteresis;
-  float veryDry  = setpoint - 2*hyster; // сильно ниже цели
-
-  if (!isnan(Ms) && Ms < veryDry && (now - lastDryAlertMs > ALERT_INTERVAL_MS)) {
-    String msg = "⚠️ Почва слишком сухая: " + String(Ms,1) + "% (цель " + String(setpoint,1) + "%)\n"
-                 "Полив уже старается догнать цель, но проверь систему.";
-    bot->sendMessage(primaryChatId, msg, "HTML");
-    lastDryAlertMs = now;
-  }
-
-  // 2) Слишком жарко
-  if (!isnan(Ta) && Ta > g_settings.comfortTempMax + 5.0f && (now - lastHotAlertMs > ALERT_INTERVAL_MS)) {
-    String msg = "🔥 В теплице очень жарко: " + String(Ta,1) + "°C\n"
-                 "Проверь вентиляцию, растения могут перегреваться.";
-    bot->sendMessage(primaryChatId, msg, "HTML");
-    lastHotAlertMs = now;
-  }
-
-  // 3) Слишком холодно
-  if (!isnan(Ta) && Ta < g_settings.comfortTempMin - 5.0f && (now - lastColdAlertMs > ALERT_INTERVAL_MS)) {
-    String msg = "🥶 В теплице холодно: " + String(Ta,1) + "°C\n"
-                 "Возможна остановка роста, подумай о подогреве.";
-    bot->sendMessage(primaryChatId, msg, "HTML");
-    lastColdAlertMs = now;
-  }
-
-  // 4) Проблемы с датчиками
   bool sensorProblem = false;
   String sensorMsg;
 
-  if (!g_deviceConfig.bmeHealthy) {
+  if (isnan(g_sensorData.airTemperature) || isnan(g_sensorData.airHumidity)) {
     sensorProblem = true;
-    sensorMsg += "BME280 (температура/влажность/давление) не отвечает.\n";
+    sensorMsg += "Датчик климата (BME280) не отвечает.\n";
   }
-  if (!g_deviceConfig.hasSoilSensor || !g_deviceConfig.soilHealthy) {
+  if (isnan(g_sensorData.soilMoisture)) {
     sensorProblem = true;
-    sensorMsg += "Датчик почвы не обнаружен или даёт некорректные данные.\n";
+    sensorMsg += "Датчик влажности почвы не отвечает.\n";
   }
-  if (!g_deviceConfig.bhHealthy) {
+  if (isnan(g_sensorData.lightLevelLux)) {
     sensorProblem = true;
-    sensorMsg += "BH1750 (освещённость) не отвечает.\n";
+    sensorMsg += "Датчик освещённости (BH1750) не отвечает.\n";
   }
 
   if (sensorProblem && (now - lastSensorAlertMs > ALERT_INTERVAL_MS)) {
     String msg = "⚙️ Проблемы с датчиками:\n" + sensorMsg;
-    bot->sendMessage(primaryChatId, msg, "HTML");
+    if (primaryChatId.length() > 0) {
+      bot->sendMessage(primaryChatId, msg, "HTML");
+    }
     lastSensorAlertMs = now;
   }
 }
